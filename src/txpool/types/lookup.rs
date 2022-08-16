@@ -72,6 +72,12 @@ impl TransactionLookup {
     {
         self.by_hash.remove(hash.borrow())
     }
+
+    #[inline]
+    pub fn clear(&mut self) {
+        self.by_hash.clear();
+        self.by_sender.clear();
+    }
 }
 
 impl Extend<Transaction> for TransactionLookup {

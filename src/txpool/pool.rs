@@ -156,12 +156,20 @@ impl<'db, E: EnvironmentKind> Stage<'db, E> for Pool {
     async fn unwind<'tx>(
         &mut self,
         _txn: &'tx mut MdbxTransaction<'db, mdbx::RW, E>,
-        _input: UnwindInput,
+        input: UnwindInput,
     ) -> anyhow::Result<UnwindOutput>
     where
         'db: 'tx,
     {
-        todo!()
+        // FIXME: implement.
+        let mut shared_state = self.state.lock();
+        shared_state.lookup.clear();
+        shared_state.best_queue.clear();
+        shared_state.worst_queue.clear();
+
+        Ok(UnwindOutput {
+            stage_progress: input.unwind_to,
+        })
     }
 }
 
