@@ -11,7 +11,8 @@
     never_type,
     poll_ready,
     slice_swap_unchecked,
-    step_trait
+    step_trait,
+    binary_heap_retain
 )]
 #![recursion_limit = "256"]
 #![allow(
@@ -60,6 +61,7 @@ pub mod stagedsync;
 pub mod stages;
 mod state;
 pub mod trie;
+pub mod txpool;
 pub(crate) mod util;
 
 pub use stagedsync::stages::StageId;
