@@ -5,7 +5,7 @@ use crate::{
         tables::{self, AccountChange},
         MdbxWithDirHandle,
     },
-    models::U256,
+    models::{BlockNumber, U256},
     p2p::{
         node::Node,
         types::{
@@ -14,7 +14,7 @@ use crate::{
         },
     },
     stagedsync::stage::{ExecOutput, Stage, StageError, StageInput, UnwindInput, UnwindOutput},
-    txpool::{types::*, PoolBuilder},
+    txpool::types::*,
     TaskGuard,
 };
 use async_trait::async_trait;
@@ -43,14 +43,18 @@ pub struct Pool {
     pub node: Arc<Node>,
     pub db: Arc<MdbxWithDirHandle<WriteMap>>,
 
-    state: Arc<Mutex<SharedState>>,
-
-    min_miner_fee: U256,
+    pub state: Arc<Mutex<SharedState>>,
+    pub min_miner_fee: U256,
 }
 
-impl Pool {
-    pub fn builder() -> PoolBuilder {
-        PoolBuilder::default()
+impl Clone for Pool {
+    fn clone(&self) -> Self {
+        Self {
+            node: self.node.clone(),
+            db: self.db.clone(),
+            state: self.state.clone(),
+            min_miner_fee: self.min_miner_fee,
+        }
     }
 }
 
@@ -69,6 +73,17 @@ impl<'db, E: EnvironmentKind> Stage<'db, E> for Pool {
         'db: 'tx,
     {
         let start_key = input.stage_progress.unwrap_or_default();
+        if start_key == BlockNumber(0) {
+            // FIXME: remove the little hack.
+            return Ok(ExecOutput::Progress {
+                stage_progress: input
+                    .previous_stage
+                    .map(|(_, number)| number)
+                    .unwrap_or_default(),
+                done: true,
+                reached_tip: true,
+            });
+        }
         let to_announce = {
             let mut shared_state = self.state.lock();
             let state_changes = txn
@@ -282,7 +297,7 @@ impl Pool {
 
         tasks.spawn({
             let this = self.clone();
-            let mut ticker = tokio::time::interval(Duration::from_secs(1));
+            let mut ticker = tokio::time::interval(Duration::from_secs(5));
 
             async move {
                 loop {
@@ -314,7 +329,7 @@ impl Pool {
             let this = self.clone();
             let base_fee = U256::ZERO;
 
-            let mut ticker = tokio::time::interval(Duration::from_secs(1));
+            let mut ticker = tokio::time::interval(Duration::from_secs(3));
 
             async move {
                 tokio::select! {

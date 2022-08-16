@@ -14,6 +14,7 @@ use akula::{
         stages::{BODIES, HEADERS},
     },
     stages::*,
+    txpool::Pool,
     version_string,
 };
 use anyhow::Context;
@@ -337,7 +338,13 @@ fn main() -> anyhow::Result<()> {
                     },
                     false,
                 );
-                staged_sync.push(BodyDownload { node, consensus }, false);
+                staged_sync.push(
+                    BodyDownload {
+                        node: node.clone(),
+                        consensus,
+                    },
+                    false,
+                );
                 staged_sync.push(TotalTxIndex, false);
                 staged_sync.push(
                     SenderRecovery {
@@ -392,6 +399,21 @@ fn main() -> anyhow::Result<()> {
                     },
                     !opt.prune,
                 );
+
+                let pool = Pool {
+                    node,
+                    db: db.clone(),
+                    state: Default::default(),
+                    min_miner_fee: Default::default(),
+                };
+                tokio::spawn({
+                    let pool = Arc::new(pool.clone());
+                    async move {
+                        pool.run().await;
+                    }
+                });
+                staged_sync.push(pool, true);
+
                 staged_sync.push(Finish, !opt.prune);
 
                 info!("Running staged sync");
