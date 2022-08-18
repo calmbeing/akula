@@ -31,31 +31,22 @@ use tracing::*;
 pub const PER_SENDER: usize = 32;
 
 #[derive(Debug, Default)]
-pub struct SharedState {
-    lookup: TransactionLookup,
-
+pub struct Queues {
     best_queue: BinaryHeap<ScoredTransaction>,
     worst_queue: BinaryHeap<ScoredTransaction>,
 }
 
 #[derive(Debug)]
-pub struct Pool {
-    pub node: Arc<Node>,
-    pub db: Arc<MdbxWithDirHandle<WriteMap>>,
-
-    pub state: Arc<Mutex<SharedState>>,
-    pub min_miner_fee: U256,
+struct TransactionPoolInner {
+    node: Arc<Node>,
+    db: Arc<MdbxWithDirHandle<WriteMap>>,
+    queues: Mutex<Queues>,
+    lookup: TransactionLookup,
 }
 
-impl Clone for Pool {
-    fn clone(&self) -> Self {
-        Self {
-            node: self.node.clone(),
-            db: self.db.clone(),
-            state: self.state.clone(),
-            min_miner_fee: self.min_miner_fee,
-        }
-    }
+#[derive(Debug)]
+pub struct Pool {
+    inner: Arc<TransactionPoolInner>,
 }
 
 #[async_trait]
@@ -85,7 +76,7 @@ impl<'db, E: EnvironmentKind> Stage<'db, E> for Pool {
             });
         }
         let to_announce = {
-            let mut shared_state = self.state.lock();
+            let mut queues = self.inner.queues.lock();
             let state_changes = txn
                 .cursor(tables::AccountChangeSet)?
                 .walk(Some(start_key))
@@ -97,7 +88,7 @@ impl<'db, E: EnvironmentKind> Stage<'db, E> for Pool {
                 .collect::<Result<HashMap<_, _>, _>>()?;
 
             let mut buf = Vec::new();
-            shared_state.worst_queue.retain(|scored| {
+            queues.worst_queue.retain(|scored| {
                 if let Some(account) = state_changes.get(&scored.sender) {
                     if account.nonce > scored.nonce {
                         false
@@ -114,7 +105,7 @@ impl<'db, E: EnvironmentKind> Stage<'db, E> for Pool {
                 }
             });
 
-            shared_state.best_queue.retain(
+            queues.best_queue.retain(
                 |ScoredTransaction {
                      sender,
                      nonce,
@@ -128,20 +119,20 @@ impl<'db, E: EnvironmentKind> Stage<'db, E> for Pool {
                     }
                 },
             );
-            shared_state.best_queue.extend(buf);
+            queues.best_queue.extend(buf);
 
-            shared_state
+            queues
                 .best_queue
                 .iter()
                 .filter_map(|scored_tx| {
-                    shared_state
+                    self.inner
                         .lookup
                         .get(scored_tx.hash)
                         .map(|tx| (tx.hash, tx.msg.clone()))
                 })
                 .collect::<Vec<_>>()
         };
-        self.node.announce_transactions(to_announce).await;
+        self.inner.node.announce_transactions(to_announce).await;
 
         Ok(ExecOutput::Progress {
             stage_progress: input
@@ -162,10 +153,9 @@ impl<'db, E: EnvironmentKind> Stage<'db, E> for Pool {
         'db: 'tx,
     {
         // FIXME: implement.
-        let mut shared_state = self.state.lock();
-        shared_state.lookup.clear();
-        shared_state.best_queue.clear();
-        shared_state.worst_queue.clear();
+        let mut queues = self.inner.queues.lock();
+        queues.best_queue.clear();
+        queues.worst_queue.clear();
 
         Ok(UnwindOutput {
             stage_progress: input.unwind_to,
@@ -174,9 +164,9 @@ impl<'db, E: EnvironmentKind> Stage<'db, E> for Pool {
 }
 
 impl Pool {
-    pub fn add_transaction<'env, 'txn>(
-        &self,
-        shared_state: &mut SharedState,
+    fn add_transaction<'env, 'txn>(
+        inner: &TransactionPoolInner,
+        queues: &mut Queues,
         txn: &'txn MdbxTransaction<'env, RO, WriteMap>,
         tx: Transaction,
         current_base_fee: U256,
@@ -184,7 +174,7 @@ impl Pool {
     where
         'env: 'txn,
     {
-        if shared_state.lookup.contains_hash(&tx.hash) {
+        if inner.lookup.contains_hash(&tx.hash) {
             return Ok(InsertionStatus::Discarded(DiscardReason::AlreadyKnown));
         };
 
@@ -197,13 +187,6 @@ impl Pool {
                 DiscardReason::InsufficientBalance,
             ));
         }
-        let miner_fee = std::cmp::min(
-            tx.max_fee_per_gas().saturating_sub(current_base_fee),
-            tx.max_priority_fee_per_gas(),
-        );
-        if miner_fee < self.min_miner_fee {
-            return Ok(InsertionStatus::Discarded(DiscardReason::PriorityFeeTooLow));
-        }
 
         let scored_transaction = ScoredTransaction::new(&tx);
         let queue_type = if tx
@@ -215,14 +198,14 @@ impl Pool {
         } else {
             QueueType::Worst
         };
-        shared_state.lookup.insert(tx);
+        inner.lookup.insert(tx);
 
         match queue_type {
             QueueType::Best => {
-                shared_state.best_queue.push(scored_transaction);
+                queues.best_queue.push(scored_transaction);
             }
             QueueType::Worst => {
-                shared_state.worst_queue.push(scored_transaction);
+                queues.worst_queue.push(scored_transaction);
             }
         }
         Ok(InsertionStatus::Inserted(queue_type))
@@ -230,14 +213,14 @@ impl Pool {
 }
 
 impl Pool {
-    pub async fn run(self: Arc<Self>) {
+    pub async fn run(&self) {
         let tasks = TaskGroup::new();
 
         let (request_tx, mut request_rx) = mpsc::channel::<(Vec<_>, _)>(128);
         tasks.spawn_with_name("transaction_requester", {
             let mut local_tasks = Vec::with_capacity(128);
 
-            let this = self.node.clone();
+            let this = self.inner.clone();
 
             async move {
                 while let Some((hashes, pred)) = request_rx.recv().await {
@@ -254,7 +237,8 @@ impl Pool {
                                 pred
                             );
 
-                            this.get_pooled_transactions(request_id, &hashes, pred)
+                            this.node
+                                .get_pooled_transactions(request_id, &hashes, pred)
                                 .await;
                         }
                     })));
@@ -264,7 +248,7 @@ impl Pool {
 
         let (penalty_tx, mut penalty_rx) = mpsc::channel(128);
         tasks.spawn_with_name("peer_penalizer", {
-            let this = self.node.clone();
+            let this = self.inner.node.clone();
 
             async move {
                 while let Some(peer_id) = penalty_rx.recv().await {
@@ -277,21 +261,16 @@ impl Pool {
 
         let (inbound_tx, mut inbound_rx) = mpsc::channel(128);
         tasks.spawn({
-            let this = self.clone();
+            let this = self.inner.clone();
 
             async move {
                 while let Some((GetPooledTransactions { request_id, hashes }, peer_id, sentry_id)) =
                     inbound_rx.recv().await
                 {
-                    let transactions = {
-                        let shared_state = this.state.lock();
-                        hashes
-                            .iter()
-                            .filter_map(|hash| {
-                                shared_state.lookup.get(hash).map(|tx| tx.msg.clone())
-                            })
-                            .collect::<Vec<_>>()
-                    };
+                    let transactions = hashes
+                        .iter()
+                        .filter_map(|hash| this.lookup.get(hash).map(|tx| tx.msg))
+                        .collect::<Vec<_>>();
                     this.node
                         .send_pooled_transactions(
                             request_id,
@@ -304,7 +283,7 @@ impl Pool {
         });
 
         tasks.spawn({
-            let this = self.clone();
+            let this = self.inner.clone();
             let mut ticker = tokio::time::interval(Duration::from_secs(5));
 
             async move {
@@ -312,15 +291,12 @@ impl Pool {
                     ticker.tick().await;
 
                     let to_announce = {
-                        let shared_state = this.state.lock();
-                        shared_state
+                        let queues = this.queues.lock();
+                        queues
                             .best_queue
                             .iter()
                             .filter_map(|scored_tx| {
-                                shared_state
-                                    .lookup
-                                    .get(scored_tx.hash)
-                                    .map(|tx| (tx.hash, tx.msg.clone()))
+                                this.lookup.get(scored_tx.hash).map(|tx| (tx.hash, tx.msg))
                             })
                             .collect::<Vec<_>>()
                     };
@@ -334,7 +310,7 @@ impl Pool {
 
         let (processor_tx, mut processor_rx) = mpsc::channel(1 << 10);
         tasks.spawn({
-            let this = self.clone();
+            let this = self.inner.clone();
             let base_fee = U256::ZERO;
 
             let mut ticker = tokio::time::interval(Duration::from_secs(3));
@@ -348,12 +324,11 @@ impl Pool {
                         }
 
                         let txn = this.db.begin()?;
-                        let mut shared_state = this.state.lock();
+                        let mut queues = this.queues.lock();
+
                         for transaction in transactions {
-                            Self::add_transaction(&this, &mut shared_state, &txn, transaction, base_fee)?;
+                            Self::add_transaction(&this, &mut queues, &txn, transaction, base_fee)?;
                         }
-
-
                     },
                 }
 
@@ -362,7 +337,7 @@ impl Pool {
         });
 
         tasks.spawn_with_name("incoming router", {
-            let this = self.clone();
+            let this = self.inner.clone();
 
             async move {
                 let mut stream = this.node.stream_transactions().await;

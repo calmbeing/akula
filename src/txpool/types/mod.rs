@@ -20,7 +20,6 @@ pub enum DiscardReason {
     Underpriced,
     NonceTooLow,
     InsufficientBalance,
-    PriorityFeeTooLow,
 }
 
 pub use self::{lookup::*, nonce::*, transaction::*};
