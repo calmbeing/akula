@@ -36,6 +36,37 @@ pub struct Queues {
     worst_queue: BinaryHeap<ScoredTransaction>,
 }
 
+#[derive(Default)]
+pub struct PoolBuilder {
+    node: Option<Arc<Node>>,
+    db: Option<Arc<MdbxWithDirHandle<WriteMap>>>,
+}
+
+impl PoolBuilder {
+    pub fn set_node(mut self, node: Arc<Node>) -> Self {
+        self.node = Some(node);
+        self
+    }
+
+    pub fn set_db(mut self, db: Arc<MdbxWithDirHandle<WriteMap>>) -> Self {
+        self.db = Some(db);
+        self
+    }
+
+    pub fn build(self) -> anyhow::Result<Pool> {
+        let node = self.node.ok_or_else(|| anyhow::anyhow!("node not set"))?;
+        let db = self.db.ok_or_else(|| anyhow::anyhow!("db not set"))?;
+        Ok(Pool {
+            inner: Arc::new(TransactionPoolInner {
+                node,
+                db,
+                queues: Default::default(),
+                lookup: Default::default(),
+            }),
+        })
+    }
+}
+
 #[derive(Debug)]
 struct TransactionPoolInner {
     node: Arc<Node>,
@@ -47,6 +78,14 @@ struct TransactionPoolInner {
 #[derive(Debug)]
 pub struct Pool {
     inner: Arc<TransactionPoolInner>,
+}
+
+impl Clone for Pool {
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+        }
+    }
 }
 
 #[async_trait]

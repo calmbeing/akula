@@ -14,7 +14,7 @@ use akula::{
         stages::{BODIES, HEADERS},
     },
     stages::*,
-    txpool::Pool,
+    txpool::PoolBuilder,
     version_string,
 };
 use anyhow::Context;
@@ -400,14 +400,12 @@ fn main() -> anyhow::Result<()> {
                     !opt.prune,
                 );
 
-                let pool = Pool {
-                    node,
-                    db: db.clone(),
-                    state: Default::default(),
-                    min_miner_fee: Default::default(),
-                };
+                let pool = PoolBuilder::default()
+                    .set_node(node.clone())
+                    .set_db(db.clone())
+                    .build()?;
                 tokio::spawn({
-                    let pool = Arc::new(pool.clone());
+                    let pool = pool.clone();
                     async move {
                         pool.run().await;
                     }
