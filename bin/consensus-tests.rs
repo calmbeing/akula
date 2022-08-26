@@ -410,6 +410,32 @@ static NETWORK_CONFIG: Lazy<HashMap<Network, ChainSpec>> = Lazy::new(|| {
                 ..Default::default()
             },
             None,
+<<<<<<< HEAD
+=======
+            10700000,
+        ),
+        (
+            Network::Merge,
+            Upgrades {
+                homestead: Some(0.into()),
+                tangerine: Some(0.into()),
+                spurious: Some(0.into()),
+                byzantium: Some(0.into()),
+                constantinople: Some(0.into()),
+                petersburg: Some(0.into()),
+                istanbul: Some(0.into()),
+                berlin: Some(0.into()),
+                london: Some(0.into()),
+                paris: Some(0.into()),
+                ramanujan: Some(0.into()),
+                niels: Some(0.into()),
+                mirrorsync: Some(0.into()),
+                bruno: Some(0.into()),
+                euler: Some(0.into()),
+            },
+            None,
+            11_200_000,
+>>>>>>> ad1333b (feat: introduce parlia to akula.)
         ),
     ]
     .into_iter()
