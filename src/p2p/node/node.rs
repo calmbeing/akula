@@ -74,14 +74,16 @@ impl Node {
             async move {
                 let mut stream = handler.sync_stream().await;
                 loop {
-                    if let Some(msg) = stream.next().await {
-                        let peer_id = msg.peer_id;
-                        let sentry_id = msg.sentry_id;
-
-                        match msg.msg {
-                            Message::NewBlockHashes(ref blocks) => {
+                    if let Some(InboundMessage {
+                        msg,
+                        peer_id,
+                        sentry_id,
+                    }) = stream.next().await
+                    {
+                        match msg {
+                            Message::NewBlockHashes(NewBlockHashes(blocks)) => {
                                 let mut max_block = None;
-                                for b in &blocks.0 {
+                                for b in &blocks {
                                     if tip_discovery && b.number > handler.chain_tip.borrow().0 {
                                         let id = thread_rng().gen::<u64>();
                                         tx.send((
@@ -106,9 +108,12 @@ impl Node {
                                         .await;
                                 }
                             }
-                            Message::BlockHeaders(ref headers) => {
+                            Message::BlockHeaders(BlockHeaders {
+                                headers,
+                                request_id,
+                            }) => {
                                 if let Some(max_header) =
-                                    headers.headers.iter().max_by_key(|header| header.number)
+                                    headers.iter().max_by_key(|header| header.number)
                                 {
                                     let _ = handler.sentries[sentry_id]
                                         .clone()
@@ -120,10 +125,10 @@ impl Node {
                                 }
 
                                 if tip_discovery
-                                    && requested.lock().remove(&headers.request_id).is_some()
-                                    && headers.headers.len() == 1
+                                    && requested.lock().remove(&request_id).is_some()
+                                    && headers.len() == 1
                                 {
-                                    let header = &headers.headers[0];
+                                    let header = &headers[0];
                                     let hash = header.hash();
 
                                     if header.number > handler.chain_tip.borrow().0 {
@@ -137,18 +142,20 @@ impl Node {
                                     }
                                 }
                             }
-                            Message::NewBlock(inner) => {
-                                let hash = inner.block.header.hash();
-                                let number = inner.block.header.number;
+                            Message::NewBlock(new_block) => {
+                                let NewBlock { block, .. } = *new_block;
+
+                                let (block_number, hash) =
+                                    (block.header.number, block.header.hash());
 
                                 handler
                                     .block_cache
                                     .lock()
-                                    .insert(hash, (sentry_id, peer_id, inner.block));
+                                    .insert(hash, (sentry_id, peer_id, block));
                                 handler.block_cache_notify.notify_one();
 
-                                if tip_discovery && number > handler.chain_tip.borrow().0 {
-                                    let _ = handler.chain_tip_sender.send((number, hash));
+                                if tip_discovery && block_number > handler.chain_tip.borrow().0 {
+                                    let _ = handler.chain_tip_sender.send((block_number, hash));
                                     for skip in 1..4_u64 {
                                         let id = rand::thread_rng().gen::<u64>();
                                         tx.send((id, PeerFilter::All, hash, skip)).await?;
@@ -228,28 +235,27 @@ impl Node {
                 .await;
 
             async move {
-                while let Some(msg) = stream.next().await {
-                    let peer_id = msg.peer_id;
-                    let sentry_id = msg.sentry_id;
-
-                    match msg.msg {
-                        Message::GetBlockHeaders(inner) => {
+                while let Some(InboundMessage {
+                    msg,
+                    peer_id,
+                    sentry_id,
+                }) = stream.next().await
+                {
+                    match msg {
+                        Message::GetBlockHeaders(GetBlockHeaders { request_id, params }) => {
                             let msg = Message::BlockHeaders(BlockHeaders {
-                                request_id: inner.request_id,
-                                headers: handler
-                                    .stash
-                                    .get_headers(inner.params)
-                                    .unwrap_or_default(),
+                                request_id,
+                                headers: handler.stash.get_headers(params).unwrap_or_default(),
                             });
 
                             handler
                                 .send_message(msg, PeerFilter::Peer(peer_id, sentry_id))
                                 .await;
                         }
-                        Message::GetBlockBodies(inner) => {
+                        Message::GetBlockBodies(GetBlockBodies { request_id, hashes }) => {
                             let msg = Message::BlockBodies(BlockBodies {
-                                request_id: inner.request_id,
-                                bodies: handler.stash.get_bodies(inner.hashes).unwrap_or_default(),
+                                request_id,
+                                bodies: handler.stash.get_bodies(hashes).unwrap_or_default(),
                             });
 
                             handler
