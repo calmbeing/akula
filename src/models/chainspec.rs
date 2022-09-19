@@ -598,7 +598,8 @@ mod tests {
                     niels: None,
                     mirrorsync: None,
                     bruno: None,
-                    euler: None
+                    euler: None,
+                    gibbs: None
                 },
                 params: Params {
                     chain_id: ChainId(4),
