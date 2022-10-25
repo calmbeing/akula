@@ -409,7 +409,9 @@ fn main() -> anyhow::Result<()> {
                         warn!("No BLS public key, will not enable mining fast finality blocks");
                     }
                 };
+
                 let mut staged_sync = stagedsync::StagedSync::new();
+
                 staged_sync.set_min_progress_to_commit_after_stage(if opt.prune {
                     u64::MAX
                 } else {
@@ -581,7 +583,7 @@ fn main() -> anyhow::Result<()> {
                     },
                     !opt.prune,
                 );
-
+                let mut mining_stage = stagedsync::StagedSync::new();
                 if can_mine {
                     staged_sync.is_mining = true;
                     let consensus_config = engine_factory(
@@ -627,7 +629,8 @@ fn main() -> anyhow::Result<()> {
                     let mining_block_mutex = Arc::new(Mutex::new(mining_block));
                     let mining_status = MiningStatus::new();
                     let mining_status_mutex = Arc::new(Mutex::new(mining_status));
-                    staged_sync.push(
+
+                    mining_stage.push(
                         CreateBlock {
                             mining_status: Arc::clone(&mining_status_mutex),
                             mining_block: Arc::clone(&mining_block_mutex),
@@ -637,7 +640,7 @@ fn main() -> anyhow::Result<()> {
                         false,
                     );
 
-                    staged_sync.push(
+                    mining_stage.push(
                         MiningExecBlock {
                             mining_status: Arc::clone(&mining_status_mutex),
                             mining_block: Arc::clone(&mining_block_mutex),
@@ -655,9 +658,16 @@ fn main() -> anyhow::Result<()> {
                     //     !opt.prune,
                     //     1,
                     // );
+                    mining_stage.push(HashState::new(etl_temp_dir.clone(), None), !opt.prune);
+
+                    mining_stage.push_with_unwind_priority(
+                        Interhashes::new(etl_temp_dir.clone(), None),
+                        !opt.prune,
+                        1,
+                    );
                     info!("createBlock stage enabled");
 
-                    staged_sync.push(
+                    mining_stage.push(
                         MiningFinishBlock {
                             mining_status: Arc::clone(&mining_status_mutex),
                             mining_block: Arc::clone(&mining_block_mutex),
@@ -671,6 +681,7 @@ fn main() -> anyhow::Result<()> {
 
                 info!("Running staged sync");
                 staged_sync.run(&db).await?;
+                mining_stage.run(&db).await?;
 
                 if opt.exit_after_sync {
                     Ok(())
