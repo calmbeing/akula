@@ -165,15 +165,6 @@ pub struct Opt {
     pub jwt_secret_path: Option<ExpandedPathBuf>,
 }
 
-async fn create_swarm_helper(opt: Opt, chain_config: ChainConfig) {
-    akula::sentry::run(
-        opt.sentry_opts,
-        opt.datadir,
-        chain_config.chain_spec.p2p.clone(),
-    )
-    .await;
-}
-
 #[allow(unreachable_code)]
 fn main() -> anyhow::Result<()> {
     let opt: Opt = Opt::parse();
@@ -231,25 +222,21 @@ fn main() -> anyhow::Result<()> {
 
     let etl_temp_path = opt_conf.datadir.etl_temp_dir();
     let etl_arc = Arc::new(Mutex::new(etl_temp_path));
-
     let etl_arc_lock = etl_arc.lock().unwrap();
+
     let _ = std::fs::remove_dir_all(&*etl_arc_lock);
-
     std::fs::create_dir_all(&*etl_arc_lock)?;
-
     let etl_temp_dir =
         Arc::new(tempfile::tempdir_in(&*etl_arc_lock).context("failed to create ETL temp dir")?);
     let etl_dir_arc = Arc::new(Mutex::new(etl_temp_dir));
     let etl_dir_full_arc = etl_dir_arc.clone();
 
-    let db = Arc::new(akula::kv::new_database(
+    let db_back = Arc::new(akula::kv::new_database(
         &CHAINDATA_TABLES,
         &akula_chain_data_dir_arc.lock().unwrap(),
     )?);
 
-    let db_back = db.clone();
     akula::database_version::migrate_database(&db_back)?;
-    let db_arc = Arc::new(Mutex::new(db));
 
     let chainspec = {
         let span = span!(Level::INFO, "", " Genesis initialization ");
@@ -268,11 +255,33 @@ fn main() -> anyhow::Result<()> {
         chainspec
     };
 
+    info!("Current network: {}", chainspec.name);
+
+    let opt: Opt = Opt::parse();
+    let jwt_secret_path = opt
+        .jwt_secret_path
+        .map(|v| v.0)
+        .unwrap_or_else(|| opt.datadir.0.join("jwt.hex"));
+    if let Ok(mut file) = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(jwt_secret_path)
+    {
+        file.write_all(
+            hex::encode(
+                std::iter::repeat_with(rand::random)
+                    .take(32)
+                    .collect::<Vec<_>>(),
+            )
+            .as_bytes(),
+        )?;
+        file.flush()?;
+    }
+
     // chainspec_arc to avoid move error.
     let chainspec_arc = Arc::new(Mutex::new(chainspec));
     let chainspec_arc_stage = chainspec_arc.clone();
 
-    // akula::database_version::migrate_database(&db_back)?;
     let chain_config = ChainConfig::from(chainspec_arc.lock().unwrap().clone());
 
     let sentries = if let Some(raw_str) = &opt_conf.sentry_api_addr {
@@ -284,13 +293,10 @@ fn main() -> anyhow::Result<()> {
         let max_peers = opt_conf.sentry_opts.max_peers;
         let sentry_api_addr = opt_conf.sentry_opts.sentry_addr;
 
-        let opt_back: Opt = Opt::parse();
         let rt = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .thread_stack_size(128 * 1024 * 1024)
             .build()?;
-
-        let swarm = create_swarm_helper(opt_back, chain_config.clone());
 
         let opt_sync: Opt = Opt::parse();
         rt.block_on(async {
@@ -306,15 +312,22 @@ fn main() -> anyhow::Result<()> {
     };
 
     let mut builder = NodeBuilder::new(chain_config.clone()).set_stash(db_back.clone());
-    for sentry_api_addr in sentries {
-        builder = builder.add_sentry(sentry_api_addr);
-    }
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_stack_size(128 * 1024 * 1024)
+        .build()?;
 
-    let node = Arc::new(builder.build()?);
+    let bu = rt.block_on(async {
+        for sentry_api_addr in sentries.clone() {
+            builder = builder.add_sentry(sentry_api_addr);
+        }
+        builder
+    });
+    let node = Arc::new(bu.build()?);
     let node_arc = Arc::new(Mutex::new(node));
     let node_stage = node_arc.clone();
 
-    // spawn mining stage thread.
+    // //spawn mining stage thread.
     // std::thread::Builder::new()
     //     .stack_size(128 * 1024 * 1024)
     //     .spawn(|| {
@@ -474,46 +487,13 @@ fn main() -> anyhow::Result<()> {
             rt.block_on(async move {
                 info!("Starting Akula ({})", version_string());
 
-                info!(
-                    "Current network: {}",
-                    chainspec_arc_stage.lock().unwrap().name
-                );
-
                 let opt: Opt = Opt::parse();
-                let jwt_secret_path = opt
-                    .jwt_secret_path
-                    .map(|v| v.0)
-                    .unwrap_or_else(|| opt.datadir.0.join("jwt.hex"));
-                if let Ok(mut file) = OpenOptions::new()
-                    .write(true)
-                    .create_new(true)
-                    .open(jwt_secret_path)
-                {
-                    file.write_all(
-                        hex::encode(
-                            std::iter::repeat_with(rand::random)
-                                .take(32)
-                                .collect::<Vec<_>>(),
-                        )
-                        .as_bytes(),
-                    )?;
-                    file.flush()?;
-                }
-
-                let akula_chain_data_dir_full = opt.datadir.clone().chain_data_dir();
-
-                let db_full = Arc::new(
-                    akula::kv::new_database(&CHAINDATA_TABLES, &akula_chain_data_dir_full.clone())
-                        .unwrap(),
-                );
-
-                let db_full_back = db_full.clone();
                 let chainspec_arc_stage_lock = chainspec_arc_stage.lock().unwrap();
                 let network_id = chainspec_arc_stage_lock.params.network_id;
 
                 if !opt.no_rpc {
                     tokio::spawn({
-                        let db = db_full.clone();
+                        let db = db_back.clone();
                         async move {
                             let http_server = HttpServerBuilder::default()
                                 .build(&opt.rpc_listen_address)
@@ -597,6 +577,7 @@ fn main() -> anyhow::Result<()> {
                     });
 
                     tokio::spawn({
+                        let db = db_back.clone();
                         async move {
                             info!("Starting gRPC server on {}", opt.grpc_listen_address);
                             let mut builder = tonic::transport::Server::builder();
@@ -614,14 +595,14 @@ fn main() -> anyhow::Result<()> {
                             builder.add_service(
                                 ethereum_interfaces::web3::debug_api_server::DebugApiServer::new(
                                     DebugApiServerImpl {
-                                        db: db_full.clone(),
+                                        db: db.clone(),
                                     }
                                 )
                             )
                             .add_service(
                                 ethereum_interfaces::web3::trace_api_server::TraceApiServer::new(
                                     TraceApiServerImpl {
-                                        db: db_full.clone(),
+                                        db,
                                         call_gas_limit: 100_000_000,
                                     },
                                 ),
@@ -676,6 +657,7 @@ fn main() -> anyhow::Result<()> {
                     _ => InitialParams::Useless,
                 };
 
+                let db_full_back = db_back.clone();
                 let consensus: Arc<dyn Consensus> = engine_factory(
                     Some(db_full_back.clone()),
                     chainspec_arc_stage_lock.clone(),
@@ -785,7 +767,7 @@ fn main() -> anyhow::Result<()> {
                 }
 
                 info!("Running staged sync");
-                staged_sync.run(&db_full_back).await?;
+                staged_sync.run(&db_back).await?;
 
                 if opt.exit_after_sync {
                     Ok(())
