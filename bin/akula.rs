@@ -168,332 +168,94 @@ pub struct Opt {
 #[allow(unreachable_code)]
 fn main() -> anyhow::Result<()> {
     let opt: Opt = Opt::parse();
-    let opt_arc = Arc::new(Mutex::new(opt));
     fdlimit::raise_fd_limit();
+
     akula_tracing::build_subscriber(Component::Core).init();
 
-    let mut can_mine = false;
-    let opt_conf = opt_arc.lock().unwrap();
-    if opt_conf.mine {
-        can_mine = true;
-        if opt_conf.exit_after_sync {
-            warn!("Conflicting options: --exit-after-sync is set, will not enable mining");
-            can_mine = false;
-        }
-
-        if opt_conf.mine_etherbase.is_none() {
-            warn!("Etherbase not set, will not enable mining");
-            can_mine = false;
-        }
-
-        if opt_conf.mine_secretkey.is_none() {
-            warn!("No private key to sign blocks given, will not enable mining");
-            can_mine = false;
-        }
-
-        if opt_conf.bls_secret_key.is_none() {
-            warn!("No BLS private key to sign vote, will not enable mining");
-            can_mine = false;
-        }
-
-        if opt_conf.bls_public_key.is_none() {
-            warn!("No BLS public key, will not enable mining");
-            can_mine = false;
-        }
-    };
-
-    let can_mine_arc = Arc::new(Mutex::new(can_mine));
-    let can_mine_arc_stage = can_mine_arc.clone();
-
-    let mut bundled_chain_spec = false;
-
-    let chain_config = if let Some(chain) = &opt_conf.chain {
-        bundled_chain_spec = true;
-        Some(ChainSpec::load_builtin(chain)?)
-    } else if let Some(path) = &opt_conf.chain_spec_file {
-        Some(ChainSpec::load_from_file(path)?)
-    } else {
-        None
-    };
-
-    std::fs::create_dir_all(&opt_conf.datadir.0)?;
-    let akula_chain_data_dir = opt_conf.datadir.chain_data_dir();
-    let akula_chain_data_dir_arc = Arc::new(Mutex::new(akula_chain_data_dir));
-
-    let etl_temp_path = opt_conf.datadir.etl_temp_dir();
-    let etl_arc = Arc::new(Mutex::new(etl_temp_path));
-    let etl_arc_lock = etl_arc.lock().unwrap();
-
-    let _ = std::fs::remove_dir_all(&*etl_arc_lock);
-    std::fs::create_dir_all(&*etl_arc_lock)?;
-    let etl_temp_dir =
-        Arc::new(tempfile::tempdir_in(&*etl_arc_lock).context("failed to create ETL temp dir")?);
-    let etl_dir_arc = Arc::new(Mutex::new(etl_temp_dir));
-    let etl_dir_full_arc = etl_dir_arc.clone();
-
-    let db_back = Arc::new(akula::kv::new_database(
-        &CHAINDATA_TABLES,
-        &akula_chain_data_dir_arc.lock().unwrap(),
-    )?);
-
-    akula::database_version::migrate_database(&db_back)?;
-
-    let chainspec = {
-        let span = span!(Level::INFO, "", " Genesis initialization ");
-        let _g = span.enter();
-        let txn = db_back.begin_mutable()?;
-        let (chainspec, initialized) = akula::genesis::initialize_genesis(
-            &txn,
-            &etl_dir_arc.lock().unwrap(),
-            bundled_chain_spec,
-            chain_config,
-        )?;
-        if initialized {
-            txn.commit()?;
-        }
-
-        chainspec
-    };
-
-    info!("Current network: {}", chainspec.name);
-
-    let opt: Opt = Opt::parse();
-    let jwt_secret_path = opt
-        .jwt_secret_path
-        .map(|v| v.0)
-        .unwrap_or_else(|| opt.datadir.0.join("jwt.hex"));
-    if let Ok(mut file) = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(jwt_secret_path)
-    {
-        file.write_all(
-            hex::encode(
-                std::iter::repeat_with(rand::random)
-                    .take(32)
-                    .collect::<Vec<_>>(),
-            )
-            .as_bytes(),
-        )?;
-        file.flush()?;
-    }
-
-    // chainspec_arc to avoid move error.
-    let chainspec_arc = Arc::new(Mutex::new(chainspec));
-    let chainspec_arc_stage = chainspec_arc.clone();
-
-    let chain_config = ChainConfig::from(chainspec_arc.lock().unwrap().clone());
-
-    let sentries = if let Some(raw_str) = &opt_conf.sentry_api_addr {
-        raw_str
-            .split(',')
-            .filter_map(|s| s.parse::<Uri>().ok())
-            .collect::<Vec<_>>()
-    } else {
-        let max_peers = opt_conf.sentry_opts.max_peers;
-        let sentry_api_addr = opt_conf.sentry_opts.sentry_addr;
-
-        let rt = tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .thread_stack_size(128 * 1024 * 1024)
-            .build()?;
-
-        let opt_sync: Opt = Opt::parse();
-        rt.block_on(async {
-            let swarm = akula::sentry::run(
-                opt_sync.sentry_opts,
-                opt_sync.datadir,
-                chain_config.clone().chain_spec.p2p.clone(),
-            )
-            .await;
-        });
-
-        vec![format!("http://{sentry_api_addr}").parse()?]
-    };
-
-    let mut builder = NodeBuilder::new(chain_config.clone()).set_stash(db_back.clone());
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .thread_stack_size(128 * 1024 * 1024)
-        .build()?;
-
-    let bu = rt.block_on(async {
-        for sentry_api_addr in sentries.clone() {
-            builder = builder.add_sentry(sentry_api_addr);
-        }
-        builder
-    });
-    let node = Arc::new(bu.build()?);
-    let node_arc = Arc::new(Mutex::new(node));
-    let node_stage = node_arc.clone();
-
-    // //spawn mining stage thread.
-    // std::thread::Builder::new()
-    //     .stack_size(128 * 1024 * 1024)
-    //     .spawn(|| {
-    //         let opt: Opt = Opt::parse();
-    //         let rt = tokio::runtime::Builder::new_multi_thread()
-    //             .enable_all()
-    //             .thread_stack_size(128 * 1024 * 1024)
-    //             .build()
-    //             .unwrap();
-    //         rt.block_on(async move {
-    //             // init consensus init params
-    //             let chainspec_arc_lock = chainspec_arc.lock().unwrap();
-    //             let can_mine_lock = can_mine_arc.lock().unwrap();
-    //             let node_arc_lock = node_arc.lock().unwrap();
-    //             let params = match &chainspec_arc_lock.consensus.seal_verification {
-    //                 SealVerificationParams::Parlia { .. } => {
-    //                     if !can_mine_lock.clone() {
-    //                         InitialParams::Useless
-    //                     } else {
-    //                         InitialParams::Parlia(ParliaInitialParams {
-    //                             bls_prv_key: opt.bls_secret_key,
-    //                             bls_pub_key: opt.bls_public_key,
-    //                             node: Some(Arc::clone(&node_arc_lock)),
-    //                             sync_stage: None,
-    //                         })
-    //                     }
-    //                 }
-    //                 _ => InitialParams::Useless,
-    //             };
-
-    //             // init consensus init params
-    //             let params = match chainspec_arc_lock.consensus.seal_verification {
-    //                 SealVerificationParams::Parlia { .. } => {
-    //                     if !can_mine_lock.clone() {
-    //                         InitialParams::Useless
-    //                     } else {
-    //                         let opt: Opt = Opt::parse();
-    //                         InitialParams::Parlia(ParliaInitialParams {
-    //                             bls_prv_key: opt.bls_secret_key,
-    //                             bls_pub_key: opt.bls_public_key,
-    //                             node: Some(Arc::clone(&node_arc_lock)),
-    //                             sync_stage: None,
-    //                         })
-    //                     }
-    //                 }
-    //                 _ => InitialParams::Useless,
-    //             };
-
-    //             let db_back = Arc::new(
-    //                 akula::kv::new_database(
-    //                     &CHAINDATA_TABLES,
-    //                     &akula_chain_data_dir_arc.lock().unwrap(),
-    //                 )
-    //                 .unwrap(),
-    //             );
-
-    //             if can_mine_lock.clone() {
-    //                 let mut mining_stage = stagedsync::StagedSync::new();
-    //                 let consensus_config = engine_factory(
-    //                     Some(db_back.clone()),
-    //                     chainspec_arc_lock.clone(),
-    //                     Some(opt.engine_listen_address),
-    //                     params.clone(),
-    //                 )
-    //                 .unwrap();
-    //                 let config = MiningConfig {
-    //                     enabled: true,
-    //                     ether_base: opt.mine_etherbase.unwrap().clone(),
-    //                     secret_key: opt.mine_secretkey.unwrap().clone(),
-    //                     extra_data: opt.mine_extradata.map(Bytes::from).clone(),
-    //                     consensus: consensus_config,
-    //                     dao_fork_block: Some(BigInt::new(num_bigint::Sign::Plus, vec![])),
-    //                     dao_fork_support: false,
-    //                     gas_limit: 30000000,
-    //                 };
-    //                 let mining_config_mutex = Arc::new(Mutex::new(config));
-    //                 info!("Mining enabled");
-    //                 let mining_block = MiningBlock {
-    //                     header: BlockHeader {
-    //                         parent_hash: H256::zero(),
-    //                         ommers_hash: H256::zero(),
-    //                         beneficiary: Address::zero(),
-    //                         state_root: H256::zero(),
-    //                         transactions_root: H256::zero(),
-    //                         receipts_root: H256::zero(),
-    //                         logs_bloom: Bloom::zero(),
-    //                         difficulty: U256::ZERO,
-    //                         number: BlockNumber(0),
-    //                         gas_limit: 0,
-    //                         gas_used: 0,
-    //                         timestamp: 0,
-    //                         extra_data: Bytes::new(),
-    //                         mix_hash: H256::zero(),
-    //                         nonce: H64::zero(),
-    //                         base_fee_per_gas: None,
-    //                     },
-    //                     ommers: Default::default(),
-    //                     transactions: vec![],
-    //                 };
-    //                 let mining_block_mutex = Arc::new(Mutex::new(mining_block));
-    //                 let mining_status = MiningStatus::new();
-    //                 let mining_status_mutex = Arc::new(Mutex::new(mining_status));
-
-    //                 mining_stage.push(
-    //                     CreateBlock {
-    //                         mining_status: Arc::clone(&mining_status_mutex),
-    //                         mining_block: Arc::clone(&mining_block_mutex),
-    //                         mining_config: Arc::clone(&mining_config_mutex),
-    //                         chain_spec: chainspec_arc_lock.clone(),
-    //                     },
-    //                     false,
-    //                 );
-
-    //                 mining_stage.push(
-    //                     MiningExecBlock {
-    //                         mining_status: Arc::clone(&mining_status_mutex),
-    //                         mining_block: Arc::clone(&mining_block_mutex),
-    //                         mining_config: Arc::clone(&mining_config_mutex),
-    //                         chain_spec: chainspec_arc_lock.clone(),
-    //                     },
-    //                     false,
-    //                 );
-
-    //                 let etl_dir_arc_lock = etl_dir_arc.lock().unwrap();
-    //                 mining_stage.push(HashState::new(etl_dir_arc_lock.clone(), None), !opt.prune);
-
-    //                 mining_stage.push_with_unwind_priority(
-    //                     Interhashes::new(etl_dir_arc_lock.clone(), None),
-    //                     !opt.prune,
-    //                     1,
-    //                 );
-    //                 info!("createBlock stage enabled");
-
-    //                 mining_stage.push(
-    //                     MiningFinishBlock {
-    //                         mining_status: Arc::clone(&mining_status_mutex),
-    //                         mining_block: Arc::clone(&mining_block_mutex),
-    //                         mining_config: Arc::clone(&mining_config_mutex),
-    //                         chain_spec: chainspec_arc_lock.clone(),
-    //                         node: node_arc_lock.clone(),
-    //                     },
-    //                     false,
-    //                 );
-    //                 mining_stage.run(&db_back).await;
-    //             };
-    //         })
-    //     })?;
-
-    // spawn fullsync thread.
     std::thread::Builder::new()
         .stack_size(128 * 1024 * 1024)
-        .spawn(|| {
+        .spawn(move || {
             let rt = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .thread_stack_size(128 * 1024 * 1024)
                 .build()?;
+
             rt.block_on(async move {
                 info!("Starting Akula ({})", version_string());
 
-                let opt: Opt = Opt::parse();
-                let chainspec_arc_stage_lock = chainspec_arc_stage.lock().unwrap();
-                let network_id = chainspec_arc_stage_lock.params.network_id;
+                let mut bundled_chain_spec = false;
+                let chain_config = if let Some(chain) = opt.chain {
+                    bundled_chain_spec = true;
+                    Some(ChainSpec::load_builtin(&chain)?)
+                } else if let Some(path) = opt.chain_spec_file {
+                    Some(ChainSpec::load_from_file(path)?)
+                } else {
+                    None
+                };
 
+                std::fs::create_dir_all(&opt.datadir.0)?;
+                let akula_chain_data_dir = opt.datadir.chain_data_dir();
+                let etl_temp_path = opt.datadir.etl_temp_dir();
+                let _ = std::fs::remove_dir_all(&etl_temp_path);
+                std::fs::create_dir_all(&etl_temp_path)?;
+                let etl_temp_dir = Arc::new(
+                    tempfile::tempdir_in(&etl_temp_path)
+                        .context("failed to create ETL temp dir")?,
+                );
+                let db = Arc::new(akula::kv::new_database(
+                    &CHAINDATA_TABLES,
+                    &akula_chain_data_dir,
+                )?);
+
+                akula::database_version::migrate_database(&db)?;
+
+                let chainspec = {
+                    let span = span!(Level::INFO, "", " Genesis initialization ");
+                    let _g = span.enter();
+                    let txn = db.begin_mutable()?;
+                    let (chainspec, initialized) = akula::genesis::initialize_genesis(
+                        &txn,
+                        &etl_temp_dir,
+                        bundled_chain_spec,
+                        chain_config,
+                    )?;
+                    if initialized {
+                        txn.commit()?;
+                    }
+
+                    chainspec
+                };
+
+                info!("Current network: {}", chainspec.name);
+
+                let jwt_secret_path = opt
+                    .jwt_secret_path
+                    .map(|v| v.0)
+                    .unwrap_or_else(|| opt.datadir.0.join("jwt.hex"));
+                if let Ok(mut file) = OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(jwt_secret_path)
+                {
+                    file.write_all(
+                        hex::encode(
+                            std::iter::repeat_with(rand::random)
+                                .take(32)
+                                .collect::<Vec<_>>(),
+                        )
+                            .as_bytes(),
+                    )?;
+                    file.flush()?;
+                }
+
+                let network_id = chainspec.params.network_id;
+
+                let chain_config = ChainConfig::from(chainspec.clone());
+
+                let mining_db = db.clone();
                 if !opt.no_rpc {
                     tokio::spawn({
-                        let db = db_back.clone();
+                        let db = db.clone();
                         async move {
                             let http_server = HttpServerBuilder::default()
                                 .build(&opt.rpc_listen_address)
@@ -554,9 +316,9 @@ fn main() -> anyhow::Result<()> {
                                         db: db.clone(),
                                         call_gas_limit: 100_000_000,
                                     }
-                                    .into_rpc(),
+                                        .into_rpc(),
                                 )
-                                .unwrap();
+                                    .unwrap();
                             }
 
                             if api_options.is_empty() || api_options.contains("web3") {
@@ -577,7 +339,7 @@ fn main() -> anyhow::Result<()> {
                     });
 
                     tokio::spawn({
-                        let db = db_back.clone();
+                        let db = db.clone();
                         async move {
                             info!("Starting gRPC server on {}", opt.grpc_listen_address);
                             let mut builder = tonic::transport::Server::builder();
@@ -599,17 +361,17 @@ fn main() -> anyhow::Result<()> {
                                     }
                                 )
                             )
-                            .add_service(
-                                ethereum_interfaces::web3::trace_api_server::TraceApiServer::new(
-                                    TraceApiServerImpl {
-                                        db,
-                                        call_gas_limit: 100_000_000,
-                                    },
-                                ),
-                            )
-                            .serve(opt.grpc_listen_address)
-                            .await
-                            .unwrap();
+                                .add_service(
+                                    ethereum_interfaces::web3::trace_api_server::TraceApiServer::new(
+                                        TraceApiServerImpl {
+                                            db,
+                                            call_gas_limit: 100_000_000,
+                                        },
+                                    ),
+                                )
+                                .serve(opt.grpc_listen_address)
+                                .await
+                                .unwrap();
                         }
                     });
                 }
@@ -622,6 +384,35 @@ fn main() -> anyhow::Result<()> {
                     }
                 });
 
+                // staged sync setup
+                let mut can_mine = false;
+                if opt.mine {
+                    can_mine = true;
+                    if opt.exit_after_sync {
+                        warn!(
+                            "Conflicting options: --exit-after-sync is set, will not enable mining"
+                        );
+                        can_mine = false;
+                    }
+
+                    if opt.mine_etherbase.is_none() {
+                        warn!("Etherbase not set, will not enable mining");
+                        can_mine = false;
+                    }
+
+                    if opt.mine_secretkey.is_none() {
+                        warn!("No private key to sign blocks given, will not enable mining");
+                        can_mine = false;
+                    }
+
+                    if opt.bls_secret_key.is_none() {
+                        warn!("No BLS private key to sign vote, will not enable mining fast finality blocks");
+                    }
+
+                    if opt.bls_public_key.is_none() {
+                        warn!("No BLS public key, will not enable mining fast finality blocks");
+                    }
+                };
                 let mut staged_sync = stagedsync::StagedSync::new();
                 staged_sync.set_min_progress_to_commit_after_stage(if opt.prune {
                     u64::MAX
@@ -640,46 +431,84 @@ fn main() -> anyhow::Result<()> {
                         .set_delay_after_sync(Some(Duration::from_millis(opt.delay_after_sync)));
                 }
 
-                // init consensus init params
-                let params = match chainspec_arc_stage_lock.consensus.seal_verification {
-                    SealVerificationParams::Parlia { .. } => {
-                        if !can_mine_arc_stage.lock().unwrap().clone() {
-                            InitialParams::Useless
-                        } else {
-                            InitialParams::Parlia(ParliaInitialParams {
-                                bls_prv_key: opt.bls_secret_key,
-                                bls_pub_key: opt.bls_public_key,
-                                node: Some(Arc::clone(&node_stage.lock().unwrap())),
-                                sync_stage: Some(staged_sync.current_stage()),
-                            })
+                let sentries = if let Some(raw_str) = opt.sentry_api_addr {
+                    raw_str
+                        .split(',')
+                        .filter_map(|s| s.parse::<Uri>().ok())
+                        .collect::<Vec<_>>()
+                } else {
+                    let max_peers = opt.sentry_opts.max_peers;
+                    let sentry_api_addr = opt.sentry_opts.sentry_addr;
+                    let swarm = akula::sentry::run(
+                        opt.sentry_opts,
+                        opt.datadir,
+                        chain_config.chain_spec.p2p.clone(),
+                    )
+                        .await?;
+
+                    let current_stage = staged_sync.current_stage();
+
+                    tokio::spawn(async move {
+                        loop {
+                            if let Some(stage) = *current_stage.borrow() {
+                                if stage == HEADERS || stage == BODIES {
+                                    info!(
+                                        "P2P node peer info: {} active (+{} dialing) / {} max.",
+                                        swarm.connected_peers(),
+                                        swarm.dialing(),
+                                        max_peers
+                                    );
+                                }
+                            }
+
+                            sleep(Duration::from_secs(5)).await;
                         }
+                    });
+
+                    vec![format!("http://{sentry_api_addr}").parse()?]
+                };
+
+                let mut builder = NodeBuilder::new(chain_config.clone()).set_stash(db.clone());
+                for sentry_api_addr in sentries {
+                    builder = builder.add_sentry(sentry_api_addr);
+                }
+
+                let node = Arc::new(builder.build()?);
+
+                // init consensus init params
+                let params = match chainspec.consensus.seal_verification {
+                    SealVerificationParams::Parlia { .. } => {
+                        InitialParams::Parlia(ParliaInitialParams {
+                            bls_prv_key: opt.bls_secret_key,
+                            bls_pub_key: opt.bls_public_key,
+                            node: Some(Arc::clone(&node)),
+                            sync_stage: Some(staged_sync.current_stage()),
+                        })
                     }
                     _ => InitialParams::Useless,
                 };
 
-                let db_full_back = db_back.clone();
                 let consensus: Arc<dyn Consensus> = engine_factory(
-                    Some(db_full_back.clone()),
-                    chainspec_arc_stage_lock.clone(),
+                    Some(db.clone()),
+                    chainspec.clone(),
                     Some(opt.engine_listen_address),
                     params.clone(),
                 )?
-                .into();
+                    .into();
 
                 let tip_discovery =
                     !matches!(consensus.fork_choice_mode(), ForkChoiceMode::External(_));
 
                 tokio::spawn({
-                    let node = node_stage.lock().unwrap().clone();
+                    let node = node.clone();
                     async move {
                         node.start_sync(tip_discovery).await.unwrap();
                     }
                 });
 
-                let node_stage_lock = node_stage.lock().unwrap();
                 staged_sync.push(
                     HeaderDownload {
-                        node: node_stage_lock.clone(),
+                        node: node.clone(),
                         consensus: consensus.clone(),
                         max_block: opt.max_block.unwrap_or_else(|| u64::MAX.into()),
                         increment,
@@ -687,17 +516,15 @@ fn main() -> anyhow::Result<()> {
                     false,
                 );
                 staged_sync.push(TotalGasIndex, false);
-
-                let etl_dir_full_arc_lock = etl_dir_full_arc.lock().unwrap();
                 staged_sync.push(
                     BlockHashes {
-                        temp_dir: etl_dir_full_arc_lock.clone(),
+                        temp_dir: etl_temp_dir.clone(),
                     },
                     false,
                 );
                 staged_sync.push(
                     BodyDownload {
-                        node: node_stage_lock.clone(),
+                        node: node.clone(),
                         consensus,
                     },
                     false,
@@ -723,51 +550,137 @@ fn main() -> anyhow::Result<()> {
                     false,
                 );
                 if !opt.skip_commitment {
-                    staged_sync.push(
-                        HashState::new(etl_dir_full_arc_lock.clone(), None),
-                        !opt.prune,
-                    );
+                    staged_sync.push(HashState::new(etl_temp_dir.clone(), None), !opt.prune);
                     staged_sync.push_with_unwind_priority(
-                        Interhashes::new(etl_dir_full_arc_lock.clone(), None),
+                        Interhashes::new(etl_temp_dir.clone(), None),
                         !opt.prune,
                         1,
                     );
                 }
                 staged_sync.push(
                     AccountHistoryIndex {
-                        temp_dir: etl_dir_full_arc_lock.clone(),
+                        temp_dir: etl_temp_dir.clone(),
                         flush_interval: 50_000,
                     },
                     !opt.prune,
                 );
                 staged_sync.push(
                     StorageHistoryIndex {
-                        temp_dir: etl_dir_full_arc_lock.clone(),
+                        temp_dir: etl_temp_dir.clone(),
                         flush_interval: 50_000,
                     },
                     !opt.prune,
                 );
                 staged_sync.push(
                     TxLookup {
-                        temp_dir: etl_dir_full_arc_lock.clone(),
+                        temp_dir: etl_temp_dir.clone(),
                     },
                     !opt.prune,
                 );
 
                 staged_sync.push(
                     CallTraceIndex {
-                        temp_dir: etl_dir_full_arc_lock.clone(),
+                        temp_dir: etl_temp_dir.clone(),
                         flush_interval: 50_000,
                     },
                     !opt.prune,
                 );
 
-                if can_mine_arc_stage.lock().unwrap().clone() {
+                if can_mine {
                     staged_sync.is_mining = true;
+                    info!("Running staged mining");
+                    let consensus_config = engine_factory(
+                        Some(db.clone()),
+                        chainspec.clone(),
+                        Some(opt.engine_listen_address),
+                        params.clone(),
+                    )?;
+                    tokio::spawn(async move {
+                        let mut staged_mining = stagedsync::StagedSync::new();
+                        staged_mining.is_mining = true;
+                        let config = MiningConfig {
+                            enabled: true,
+                            ether_base: opt.mine_etherbase.unwrap().clone(),
+                            secret_key: opt.mine_secretkey.unwrap().clone(),
+                            extra_data: opt.mine_extradata.map(Bytes::from).clone(),
+                            consensus: consensus_config,
+                            dao_fork_block: Some(BigInt::new(num_bigint::Sign::Plus, vec![])),
+                            dao_fork_support: false,
+                            gas_limit: 30000000,
+                        };
+                        let mining_config_mutex = Arc::new(Mutex::new(config));
+                        info!("Mining enabled");
+                        let mining_block = MiningBlock {
+                            header: BlockHeader {
+                                parent_hash: H256::zero(),
+                                ommers_hash: H256::zero(),
+                                beneficiary: Address::zero(),
+                                state_root: H256::zero(),
+                                transactions_root: H256::zero(),
+                                receipts_root: H256::zero(),
+                                logs_bloom: Bloom::zero(),
+                                difficulty: U256::ZERO,
+                                number: BlockNumber(0),
+                                gas_limit: 0,
+                                gas_used: 0,
+                                timestamp: 0,
+                                extra_data: Bytes::new(),
+                                mix_hash: H256::zero(),
+                                nonce: H64::zero(),
+                                base_fee_per_gas: None,
+                            },
+                            ommers: Default::default(),
+                            transactions: vec![],
+                        };
+                        let mining_block_mutex = Arc::new(Mutex::new(mining_block));
+                        let mining_status = MiningStatus::new();
+                        let mining_status_mutex = Arc::new(Mutex::new(mining_status));
+                        staged_mining.push(
+                            CreateBlock {
+                                mining_status: Arc::clone(&mining_status_mutex),
+                                mining_block: Arc::clone(&mining_block_mutex),
+                                mining_config: Arc::clone(&mining_config_mutex),
+                                chain_spec: chainspec.clone(),
+                            },
+                            false,
+                        );
+
+                        staged_mining.push(
+                            MiningExecBlock {
+                                mining_status: Arc::clone(&mining_status_mutex),
+                                mining_block: Arc::clone(&mining_block_mutex),
+                                mining_config: Arc::clone(&mining_config_mutex),
+                                chain_spec: chainspec.clone(),
+                            },
+                            false,
+                        );
+
+                        // TODO Error: Faulty cumulative index: max gas less than current gas (1395722 < 1532487), you should mining after latest block
+                        // staged_sync.push(HashState::new(etl_temp_dir.clone(), None), !opt.prune);
+                        //
+                        // staged_sync.push_with_unwind_priority(
+                        //     Interhashes::new(etl_temp_dir.clone(), None),
+                        //     !opt.prune,
+                        //     1,
+                        // );
+                        info!("createBlock stage enabled");
+
+                        staged_mining.push(
+                            MiningFinishBlock {
+                                mining_status: Arc::clone(&mining_status_mutex),
+                                mining_block: Arc::clone(&mining_block_mutex),
+                                mining_config: Arc::clone(&mining_config_mutex),
+                                chain_spec: chainspec.clone(),
+                                node: node.clone(),
+                            },
+                            false,
+                        );
+                        staged_mining.run(&mining_db).await.unwrap()
+                    });
                 }
 
                 info!("Running staged sync");
-                staged_sync.run(&db_back).await?;
+                staged_sync.run(&db).await?;
 
                 if opt.exit_after_sync {
                     Ok(())
